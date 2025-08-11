@@ -47,6 +47,7 @@ struct BuildkitePipeline {
     web_url: Option<String>,
     repository: Option<String>,
     provider: Option<BuildkiteProvider>,
+    visibility: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -219,7 +220,7 @@ async fn handle_webhook(
     tracing::info!("Received webhook: {:?}", payload);
 
     let message_content = format_buildkite_message(&payload);
-    
+
     // Don't send empty messages (filtered events)
     if message_content.trim().is_empty() {
         tracing::info!("Skipping filtered event: {}", payload.event);
@@ -227,7 +228,7 @@ async fn handle_webhook(
             message: "Filtered".to_string(),
         }));
     }
-    
+
     let topic = format_buildkite_topic(&payload);
 
     // Determine the target stream based on pipeline name
@@ -256,7 +257,7 @@ fn get_github_repo_url(pipeline: &BuildkitePipeline) -> Option<String> {
         if let Some(repo_url) = &provider.repository_url {
             return Some(repo_url.clone());
         }
-        
+
         // Then try provider.settings.repository and convert to GitHub URL
         if let Some(settings) = &provider.settings {
             if let Some(repository) = &settings.repository {
@@ -264,12 +265,13 @@ fn get_github_repo_url(pipeline: &BuildkitePipeline) -> Option<String> {
             }
         }
     }
-    
+
     // Finally try pipeline.repository and convert it to GitHub URL
     if let Some(repository) = &pipeline.repository {
         // Handle git@github.com:owner/repo.git format
         if repository.starts_with("git@github.com:") {
-            let repo_part = repository.strip_prefix("git@github.com:")
+            let repo_part = repository
+                .strip_prefix("git@github.com:")
                 .and_then(|s| s.strip_suffix(".git"))
                 .unwrap_or(repository);
             return Some(format!("https://github.com/{}", repo_part));
@@ -280,7 +282,7 @@ fn get_github_repo_url(pipeline: &BuildkitePipeline) -> Option<String> {
             return Some(repo_url.to_string());
         }
     }
-    
+
     None
 }
 
@@ -290,7 +292,7 @@ fn get_job_display_name(job: &BuildkiteJob) -> String {
             return name.clone();
         }
     }
-    
+
     // Fallback to first line of command if name is not available
     if let Some(command) = &job.command {
         let first_line = command.lines().next().unwrap_or("");
@@ -302,7 +304,7 @@ fn get_job_display_name(job: &BuildkiteJob) -> String {
             return first_line.to_string();
         }
     }
-    
+
     "unnamed job".to_string()
 }
 
@@ -315,7 +317,16 @@ fn determine_target_stream(event: &BuildkiteWebhookEvent, default_stream: &str) 
                 let parts: Vec<&str> = name_lower.split('-').collect();
                 if parts.len() >= 2 {
                     // Take the second part (after lang- or keyboard-)
-                    return parts[1].to_string();
+                    let mut stream_name = parts[1].to_string();
+
+                    // If the repository is private, append -priv suffix
+                    if let Some(ref visibility) = pipeline.visibility {
+                        if visibility == "private" {
+                            stream_name.push_str("-priv");
+                        }
+                    }
+
+                    return stream_name;
                 }
             }
         }
@@ -337,6 +348,9 @@ fn format_buildkite_message(event: &BuildkiteWebhookEvent) -> String {
 
                 if let Some(ref message) = build.message {
                     if !message.trim().is_empty() {
+                        let message = message.split('\n').next().unwrap_or(message);
+                        let message = message.trim();
+
                         // Add GitHub commit link if we have a commit SHA and repository URL
                         let commit_link = if let (Some(commit), Some(pipeline)) =
                             (&build.commit, &event.pipeline)
@@ -526,7 +540,8 @@ fn format_buildkite_message(event: &BuildkiteWebhookEvent) -> String {
                 String::new() // Don't forward if no job data
             }
         }
-        "job.started" | "job.scheduled" | "job.canceled" | "job.retried" | "job.timed_out" | "job.assigned" => {
+        "job.started" | "job.scheduled" | "job.canceled" | "job.retried" | "job.timed_out"
+        | "job.assigned" => {
             // Don't forward any other job events
             String::new()
         }
@@ -636,7 +651,10 @@ fn format_buildkite_message(event: &BuildkiteWebhookEvent) -> String {
 
 fn format_buildkite_topic(event: &BuildkiteWebhookEvent) -> String {
     if let Some(ref pipeline) = event.pipeline {
-        format!("{} - Build", pipeline.name.as_deref().unwrap_or("Buildkite"))
+        format!(
+            "{} - Build",
+            pipeline.name.as_deref().unwrap_or("Buildkite")
+        )
     } else {
         "Build".to_string()
     }
@@ -784,6 +802,7 @@ fn create_mock_build_started(build_number: i32) -> BuildkiteWebhookEvent {
                 }),
                 repository_url: Some("https://github.com/my-org/my-repo".to_string()),
             }),
+            visibility: Some("public".to_string()),
         }),
     }
 }
@@ -855,6 +874,7 @@ fn create_mock_build_finished(state: &str, build_number: i32) -> BuildkiteWebhoo
                 }),
                 repository_url: Some("https://github.com/my-org/my-repo".to_string()),
             }),
+            visibility: Some("public".to_string()),
         }),
     }
 }
@@ -902,6 +922,7 @@ fn create_mock_job_finished(exit_status: i32, build_number: i32) -> BuildkiteWeb
                 }),
                 repository_url: Some("https://github.com/my-org/my-repo".to_string()),
             }),
+            visibility: Some("public".to_string()),
         }),
         agent: None,
         annotation: None,
@@ -949,6 +970,7 @@ fn create_mock_lang_pipeline_event(build_number: i32) -> BuildkiteWebhookEvent {
                 }),
                 repository_url: Some("https://github.com/my-org/my-repo".to_string()),
             }),
+            visibility: Some("private".to_string()),
         }),
         agent: None,
         annotation: None,
@@ -989,6 +1011,7 @@ fn create_mock_keyboard_pipeline_event(build_number: i32) -> BuildkiteWebhookEve
                 }),
                 repository_url: Some("https://github.com/my-org/my-repo".to_string()),
             }),
+            visibility: Some("public".to_string()),
         }),
     }
 }
@@ -1032,6 +1055,7 @@ mod tests {
                     }),
                     repository_url: Some("https://github.com/my-org/my-repo".to_string()),
                 }),
+                visibility: None,
             }),
         };
 
@@ -1209,6 +1233,7 @@ mod tests {
                 web_url: None,
                 repository: None,
                 provider: None,
+                visibility: None,
             }),
         };
 
@@ -1249,6 +1274,7 @@ mod tests {
                 web_url: None,
                 repository: None,
                 provider: None,
+                visibility: None,
             }),
             agent: None,
             annotation: None,
@@ -1273,12 +1299,13 @@ mod tests {
                 web_url: None,
                 repository: None,
                 provider: None,
+                visibility: Some("private".to_string()),
             }),
             agent: None,
             annotation: None,
         };
 
-        assert_eq!(determine_target_stream(&lang_event, "default"), "foo");
+        assert_eq!(determine_target_stream(&lang_event, "default"), "foo-priv");
 
         // Test keyboard- prefix
         let keyboard_event = BuildkiteWebhookEvent {
@@ -1293,6 +1320,7 @@ mod tests {
                 web_url: None,
                 repository: None,
                 provider: None,
+                visibility: Some("public".to_string()),
             }),
             agent: None,
             annotation: None,
@@ -1313,12 +1341,13 @@ mod tests {
                 web_url: None,
                 repository: None,
                 provider: None,
+                visibility: None,
             }),
             agent: None,
             annotation: None,
         };
 
-        assert_eq!(determine_target_stream(&mixed_case_event, "default"), "baz");
+        assert_eq!(determine_target_stream(&mixed_case_event, "default"), "baz"); // No -priv suffix when visibility is None
 
         // Test default fallback for other pipelines
         let other_event = BuildkiteWebhookEvent {
@@ -1333,6 +1362,7 @@ mod tests {
                 web_url: None,
                 repository: None,
                 provider: None,
+                visibility: None,
             }),
             agent: None,
             annotation: None,
@@ -1459,6 +1489,7 @@ mod tests {
                     }),
                     repository_url: Some("https://github.com/my-org/my-repo".to_string()),
                 }),
+                visibility: None,
             }),
         };
 
