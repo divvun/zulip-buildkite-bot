@@ -540,11 +540,6 @@ fn format_buildkite_message(event: &BuildkiteWebhookEvent) -> String {
                 String::new() // Don't forward if no job data
             }
         }
-        "job.started" | "job.scheduled" | "job.canceled" | "job.retried" | "job.timed_out"
-        | "job.assigned" => {
-            // Don't forward any other job events
-            String::new()
-        }
         "agent.connected" => {
             if let Some(ref agent) = event.agent {
                 format!(
@@ -644,7 +639,8 @@ fn format_buildkite_message(event: &BuildkiteWebhookEvent) -> String {
             }
         }
         _ => {
-            format!("📢 Buildkite event: {}", event.event)
+            // Don't forward any other job events
+            String::new()
         }
     }
 }
