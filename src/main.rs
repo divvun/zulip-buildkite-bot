@@ -32,6 +32,7 @@ struct BuildkiteBuild {
 struct BuildkiteJob {
     id: Option<String>,
     name: Option<String>,
+    command: Option<String>,
     state: Option<String>,
     exit_status: Option<i32>,
     web_url: Option<String>,
@@ -44,6 +45,7 @@ struct BuildkitePipeline {
     slug: Option<String>,
     url: Option<String>,
     web_url: Option<String>,
+    repository: Option<String>,
     provider: Option<BuildkiteProvider>,
 }
 
@@ -75,7 +77,14 @@ struct BuildkiteAnnotation {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct BuildkiteProvider {
+    id: Option<String>,
+    settings: Option<BuildkiteProviderSettings>,
     repository_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct BuildkiteProviderSettings {
+    repository: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -194,7 +203,7 @@ async fn start_server(
         .route("/webhook", post(handle_webhook))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     tracing::info!("Webhook server listening on {}", addr);
@@ -210,6 +219,15 @@ async fn handle_webhook(
     tracing::info!("Received webhook: {:?}", payload);
 
     let message_content = format_buildkite_message(&payload);
+    
+    // Don't send empty messages (filtered events)
+    if message_content.trim().is_empty() {
+        tracing::info!("Skipping filtered event: {}", payload.event);
+        return Ok(ResponseJson(WebhookResponse {
+            message: "Filtered".to_string(),
+        }));
+    }
+    
     let topic = format_buildkite_topic(&payload);
 
     // Determine the target stream based on pipeline name
@@ -230,6 +248,62 @@ async fn handle_webhook(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+fn get_github_repo_url(pipeline: &BuildkitePipeline) -> Option<String> {
+    // First try provider.repository_url (if it exists)
+    if let Some(provider) = &pipeline.provider {
+        if let Some(repo_url) = &provider.repository_url {
+            return Some(repo_url.clone());
+        }
+        
+        // Then try provider.settings.repository and convert to GitHub URL
+        if let Some(settings) = &provider.settings {
+            if let Some(repository) = &settings.repository {
+                return Some(format!("https://github.com/{}", repository));
+            }
+        }
+    }
+    
+    // Finally try pipeline.repository and convert it to GitHub URL
+    if let Some(repository) = &pipeline.repository {
+        // Handle git@github.com:owner/repo.git format
+        if repository.starts_with("git@github.com:") {
+            let repo_part = repository.strip_prefix("git@github.com:")
+                .and_then(|s| s.strip_suffix(".git"))
+                .unwrap_or(repository);
+            return Some(format!("https://github.com/{}", repo_part));
+        }
+        // Handle https://github.com/owner/repo.git format
+        if repository.starts_with("https://github.com/") {
+            let repo_url = repository.strip_suffix(".git").unwrap_or(repository);
+            return Some(repo_url.to_string());
+        }
+    }
+    
+    None
+}
+
+fn get_job_display_name(job: &BuildkiteJob) -> String {
+    if let Some(name) = &job.name {
+        if !name.trim().is_empty() {
+            return name.clone();
+        }
+    }
+    
+    // Fallback to first line of command if name is not available
+    if let Some(command) = &job.command {
+        let first_line = command.lines().next().unwrap_or("");
+        if !first_line.trim().is_empty() {
+            // Truncate long commands to keep messages concise
+            if first_line.len() > 40 {
+                return format!("{}...", &first_line[..37]);
+            }
+            return first_line.to_string();
+        }
+    }
+    
+    "unnamed job".to_string()
 }
 
 fn determine_target_stream(event: &BuildkiteWebhookEvent, default_stream: &str) -> String {
@@ -267,13 +341,9 @@ fn format_buildkite_message(event: &BuildkiteWebhookEvent) -> String {
                         let commit_link = if let (Some(commit), Some(pipeline)) =
                             (&build.commit, &event.pipeline)
                         {
-                            if let Some(provider) = &pipeline.provider {
-                                if let Some(repo_url) = &provider.repository_url {
-                                    let short_sha = commit.chars().take(7).collect::<String>();
-                                    format!(" ([{}]({}/commit/{}))", short_sha, repo_url, commit)
-                                } else {
-                                    String::new()
-                                }
+                            if let Some(repo_url) = get_github_repo_url(pipeline) {
+                                let short_sha = commit.chars().take(7).collect::<String>();
+                                format!(" ([{}]({}/commit/{}))", short_sha, repo_url, commit)
                             } else {
                                 String::new()
                             }
@@ -294,11 +364,35 @@ fn format_buildkite_message(event: &BuildkiteWebhookEvent) -> String {
         }
         "build.scheduled" => {
             if let Some(ref build) = event.build {
-                format!(
+                let base_message = format!(
                     "📅 Build [#{}]({}) scheduled",
                     build.number.unwrap_or(0),
                     build.web_url.as_deref().unwrap_or("#")
-                )
+                );
+
+                if let Some(ref message) = build.message {
+                    if !message.trim().is_empty() {
+                        // Add GitHub commit link if we have a commit SHA and repository URL
+                        let commit_link = if let (Some(commit), Some(pipeline)) =
+                            (&build.commit, &event.pipeline)
+                        {
+                            if let Some(repo_url) = get_github_repo_url(pipeline) {
+                                let short_sha = commit.chars().take(7).collect::<String>();
+                                format!(" ([{}]({}/commit/{}))", short_sha, repo_url, commit)
+                            } else {
+                                String::new()
+                            }
+                        } else {
+                            String::new()
+                        };
+
+                        format!("{}\n> {}{}", base_message, message, commit_link)
+                    } else {
+                        base_message
+                    }
+                } else {
+                    base_message
+                }
             } else {
                 "📅 Build scheduled".to_string()
             }
@@ -361,13 +455,9 @@ fn format_buildkite_message(event: &BuildkiteWebhookEvent) -> String {
                         let commit_link = if let (Some(commit), Some(pipeline)) =
                             (&build.commit, &event.pipeline)
                         {
-                            if let Some(provider) = &pipeline.provider {
-                                if let Some(repo_url) = &provider.repository_url {
-                                    let short_sha = commit.chars().take(7).collect::<String>();
-                                    format!(" ([{}]({}/commit/{}))", short_sha, repo_url, commit)
-                                } else {
-                                    String::new()
-                                }
+                            if let Some(repo_url) = get_github_repo_url(pipeline) {
+                                let short_sha = commit.chars().take(7).collect::<String>();
+                                format!(" ([{}]({}/commit/{}))", short_sha, repo_url, commit)
                             } else {
                                 String::new()
                             }
@@ -420,7 +510,7 @@ fn format_buildkite_message(event: &BuildkiteWebhookEvent) -> String {
         "job.finished" => {
             if let Some(ref job) = event.job {
                 let (emoji, status_text) = match job.exit_status {
-                    Some(0) => ("✅", "passed"),
+                    Some(0) => return String::new(), // Don't forward successful jobs
                     Some(_) => ("❌", "failed"),
                     None => ("❓", "finished"),
                 };
@@ -428,79 +518,17 @@ fn format_buildkite_message(event: &BuildkiteWebhookEvent) -> String {
                 format!(
                     "{} Job ['{}']({}) {}",
                     emoji,
-                    job.name.as_deref().unwrap_or("unknown"),
+                    get_job_display_name(job),
                     job.web_url.as_deref().unwrap_or("#"),
                     status_text
                 )
             } else {
-                "✅ Job finished".to_string()
+                String::new() // Don't forward if no job data
             }
         }
-        "job.started" => {
-            if let Some(ref job) = event.job {
-                format!(
-                    "🔄 Job ['{}']({}) started",
-                    job.name.as_deref().unwrap_or("unknown"),
-                    job.web_url.as_deref().unwrap_or("#")
-                )
-            } else {
-                "🔄 Job started".to_string()
-            }
-        }
-        "job.scheduled" => {
-            if let Some(ref job) = event.job {
-                format!(
-                    "📅 Job ['{}']({}) scheduled",
-                    job.name.as_deref().unwrap_or("unknown"),
-                    job.web_url.as_deref().unwrap_or("#")
-                )
-            } else {
-                "📅 Job scheduled".to_string()
-            }
-        }
-        "job.canceled" => {
-            if let Some(ref job) = event.job {
-                format!(
-                    "⏹️ Job ['{}']({}) canceled",
-                    job.name.as_deref().unwrap_or("unknown"),
-                    job.web_url.as_deref().unwrap_or("#")
-                )
-            } else {
-                "⏹️ Job canceled".to_string()
-            }
-        }
-        "job.retried" => {
-            if let Some(ref job) = event.job {
-                format!(
-                    "🔁 Job ['{}']({}) retried",
-                    job.name.as_deref().unwrap_or("unknown"),
-                    job.web_url.as_deref().unwrap_or("#")
-                )
-            } else {
-                "🔁 Job retried".to_string()
-            }
-        }
-        "job.timed_out" => {
-            if let Some(ref job) = event.job {
-                format!(
-                    "⏰ Job ['{}']({}) timed out",
-                    job.name.as_deref().unwrap_or("unknown"),
-                    job.web_url.as_deref().unwrap_or("#")
-                )
-            } else {
-                "⏰ Job timed out".to_string()
-            }
-        }
-        "job.assigned" => {
-            if let Some(ref job) = event.job {
-                format!(
-                    "👤 Job ['{}']({}) assigned",
-                    job.name.as_deref().unwrap_or("unknown"),
-                    job.web_url.as_deref().unwrap_or("#")
-                )
-            } else {
-                "👤 Job assigned".to_string()
-            }
+        "job.started" | "job.scheduled" | "job.canceled" | "job.retried" | "job.timed_out" | "job.assigned" => {
+            // Don't forward any other job events
+            String::new()
         }
         "agent.connected" => {
             if let Some(ref agent) = event.agent {
@@ -607,20 +635,10 @@ fn format_buildkite_message(event: &BuildkiteWebhookEvent) -> String {
 }
 
 fn format_buildkite_topic(event: &BuildkiteWebhookEvent) -> String {
-    if let Some(ref build) = event.build {
-        if let Some(ref pipeline) = event.pipeline {
-            format!(
-                "{} - Build #{}",
-                pipeline.name.as_deref().unwrap_or("Buildkite"),
-                build.number.unwrap_or(0)
-            )
-        } else {
-            format!("Build #{}", build.number.unwrap_or(0))
-        }
-    } else if let Some(ref pipeline) = event.pipeline {
-        pipeline.name.as_deref().unwrap_or("Buildkite").to_string()
+    if let Some(ref pipeline) = event.pipeline {
+        format!("{} - Build", pipeline.name.as_deref().unwrap_or("Buildkite"))
     } else {
-        "Buildkite".to_string()
+        "Build".to_string()
     }
 }
 
@@ -758,7 +776,12 @@ fn create_mock_build_started(build_number: i32) -> BuildkiteWebhookEvent {
                     .to_string(),
             ),
             web_url: Some("https://buildkite.com/my-org/my-awesome-pipeline".to_string()),
+            repository: Some("git@github.com:my-org/my-repo.git".to_string()),
             provider: Some(BuildkiteProvider {
+                id: Some("github".to_string()),
+                settings: Some(BuildkiteProviderSettings {
+                    repository: Some("my-org/my-repo".to_string()),
+                }),
                 repository_url: Some("https://github.com/my-org/my-repo".to_string()),
             }),
         }),
@@ -824,7 +847,12 @@ fn create_mock_build_finished(state: &str, build_number: i32) -> BuildkiteWebhoo
                     .to_string(),
             ),
             web_url: Some("https://buildkite.com/my-org/my-awesome-pipeline".to_string()),
+            repository: Some("git@github.com:my-org/my-repo.git".to_string()),
             provider: Some(BuildkiteProvider {
+                id: Some("github".to_string()),
+                settings: Some(BuildkiteProviderSettings {
+                    repository: Some("my-org/my-repo".to_string()),
+                }),
                 repository_url: Some("https://github.com/my-org/my-repo".to_string()),
             }),
         }),
@@ -849,6 +877,7 @@ fn create_mock_job_finished(exit_status: i32, build_number: i32) -> BuildkiteWeb
         job: Some(BuildkiteJob {
             id: Some(job_id.to_string()),
             name: Some(job_name.to_string()),
+            command: Some("npm test".to_string()),
             state: Some(if exit_status == 0 { "passed" } else { "failed" }.to_string()),
             exit_status: Some(exit_status),
             web_url: Some(format!(
@@ -865,7 +894,12 @@ fn create_mock_job_finished(exit_status: i32, build_number: i32) -> BuildkiteWeb
                     .to_string(),
             ),
             web_url: Some("https://buildkite.com/my-org/my-awesome-pipeline".to_string()),
+            repository: Some("git@github.com:my-org/my-repo.git".to_string()),
             provider: Some(BuildkiteProvider {
+                id: Some("github".to_string()),
+                settings: Some(BuildkiteProviderSettings {
+                    repository: Some("my-org/my-repo".to_string()),
+                }),
                 repository_url: Some("https://github.com/my-org/my-repo".to_string()),
             }),
         }),
@@ -907,7 +941,12 @@ fn create_mock_lang_pipeline_event(build_number: i32) -> BuildkiteWebhookEvent {
                     .to_string(),
             ),
             web_url: Some("https://buildkite.com/my-org/lang-sami-x-private".to_string()),
+            repository: Some("git@github.com:my-org/my-repo.git".to_string()),
             provider: Some(BuildkiteProvider {
+                id: Some("github".to_string()),
+                settings: Some(BuildkiteProviderSettings {
+                    repository: Some("my-org/my-repo".to_string()),
+                }),
                 repository_url: Some("https://github.com/my-org/my-repo".to_string()),
             }),
         }),
@@ -942,7 +981,12 @@ fn create_mock_keyboard_pipeline_event(build_number: i32) -> BuildkiteWebhookEve
             slug: Some("keyboard-finnish-public".to_string()),
             url: Some("https://api.buildkite.com/v2/organizations/my-org/pipelines/keyboard-finnish-public".to_string()),
             web_url: Some("https://buildkite.com/my-org/keyboard-finnish-public".to_string()),
+            repository: Some("git@github.com:my-org/my-repo.git".to_string()),
             provider: Some(BuildkiteProvider {
+                id: Some("github".to_string()),
+                settings: Some(BuildkiteProviderSettings {
+                    repository: Some("my-org/my-repo".to_string()),
+                }),
                 repository_url: Some("https://github.com/my-org/my-repo".to_string()),
             }),
         }),
@@ -980,7 +1024,12 @@ mod tests {
                 slug: Some("my-pipeline".to_string()),
                 url: Some("https://api.buildkite.com/v2/pipelines/123".to_string()),
                 web_url: Some("https://buildkite.com/org/my-pipeline".to_string()),
+                repository: None,
                 provider: Some(BuildkiteProvider {
+                    id: Some("github".to_string()),
+                    settings: Some(BuildkiteProviderSettings {
+                        repository: Some("my-org/my-repo".to_string()),
+                    }),
                     repository_url: Some("https://github.com/my-org/my-repo".to_string()),
                 }),
             }),
@@ -1091,12 +1140,36 @@ mod tests {
 
     #[test]
     fn test_format_job_finished() {
-        let event = BuildkiteWebhookEvent {
+        // Test failed job (should be forwarded)
+        let failed_event = BuildkiteWebhookEvent {
             event: "job.finished".to_string(),
             build: None,
             job: Some(BuildkiteJob {
                 id: Some("job123".to_string()),
                 name: Some("Test Suite".to_string()),
+                command: Some("npm test".to_string()),
+                state: Some("failed".to_string()),
+                exit_status: Some(1),
+                web_url: Some("https://buildkite.com/org/pipeline/builds/42#job123".to_string()),
+            }),
+            agent: None,
+            annotation: None,
+            pipeline: None,
+        };
+
+        let message = format_buildkite_message(&failed_event);
+        assert!(message.contains("❌ Job ['Test Suite']"));
+        assert!(message.contains("failed"));
+        assert!(message.contains("(https://buildkite.com/org/pipeline/builds/42#job123)"));
+
+        // Test successful job (should be filtered out)
+        let success_event = BuildkiteWebhookEvent {
+            event: "job.finished".to_string(),
+            build: None,
+            job: Some(BuildkiteJob {
+                id: Some("job123".to_string()),
+                name: Some("Test Suite".to_string()),
+                command: Some("npm test".to_string()),
                 state: Some("passed".to_string()),
                 exit_status: Some(0),
                 web_url: Some("https://buildkite.com/org/pipeline/builds/42#job123".to_string()),
@@ -1106,11 +1179,8 @@ mod tests {
             pipeline: None,
         };
 
-        let message = format_buildkite_message(&event);
-        assert!(message.contains("✅ Job ['Test Suite']"));
-        assert!(message.contains("passed"));
-        assert!(message.contains("(https://buildkite.com/org/pipeline/builds/42#job123)"));
-        assert!(!message.contains("```spoiler")); // No spoiler details
+        let success_message = format_buildkite_message(&success_event);
+        assert!(success_message.is_empty()); // Should be empty (filtered)
     }
 
     #[test]
@@ -1137,12 +1207,13 @@ mod tests {
                 slug: None,
                 url: None,
                 web_url: None,
+                repository: None,
                 provider: None,
             }),
         };
 
         let topic = format_buildkite_topic(&event_with_pipeline_and_build);
-        assert_eq!(topic, "My Pipeline - Build #42");
+        assert_eq!(topic, "My Pipeline - Build");
 
         let event_with_build_only = BuildkiteWebhookEvent {
             event: "build.started".to_string(),
@@ -1164,7 +1235,7 @@ mod tests {
         };
 
         let topic = format_buildkite_topic(&event_with_build_only);
-        assert_eq!(topic, "Build #42");
+        assert_eq!(topic, "Build");
 
         let event_with_pipeline_only = BuildkiteWebhookEvent {
             event: "job.finished".to_string(),
@@ -1176,6 +1247,7 @@ mod tests {
                 slug: None,
                 url: None,
                 web_url: None,
+                repository: None,
                 provider: None,
             }),
             agent: None,
@@ -1183,7 +1255,7 @@ mod tests {
         };
 
         let topic = format_buildkite_topic(&event_with_pipeline_only);
-        assert_eq!(topic, "My Pipeline");
+        assert_eq!(topic, "My Pipeline - Build");
     }
 
     #[test]
@@ -1199,6 +1271,7 @@ mod tests {
                 slug: None,
                 url: None,
                 web_url: None,
+                repository: None,
                 provider: None,
             }),
             agent: None,
@@ -1218,6 +1291,7 @@ mod tests {
                 slug: None,
                 url: None,
                 web_url: None,
+                repository: None,
                 provider: None,
             }),
             agent: None,
@@ -1237,6 +1311,7 @@ mod tests {
                 slug: None,
                 url: None,
                 web_url: None,
+                repository: None,
                 provider: None,
             }),
             agent: None,
@@ -1256,6 +1331,7 @@ mod tests {
                 slug: None,
                 url: None,
                 web_url: None,
+                repository: None,
                 provider: None,
             }),
             agent: None,
@@ -1281,5 +1357,120 @@ mod tests {
             determine_target_stream(&no_pipeline_event, "buildkite"),
             "buildkite"
         );
+    }
+
+    #[test]
+    fn test_format_job_scheduled_no_name() {
+        // Note: job.scheduled events are now filtered out, so this should return empty
+        let event = BuildkiteWebhookEvent {
+            event: "job.scheduled".to_string(),
+            build: None,
+            job: Some(BuildkiteJob {
+                id: Some("019884c5-7882-4b50-a31e-fdad05e19604".to_string()),
+                name: None, // No name like in real Buildkite webhook
+                command: Some("cargo build --bin box --release\nbuildkite-agent artifact upload target/release/box".to_string()),
+                state: Some("scheduled".to_string()),
+                exit_status: None,
+                web_url: Some("https://buildkite.com/divvun/box/builds/3#019884c5-7882-4b50-a31e-fdad05e19604".to_string()),
+            }),
+            agent: None,
+            annotation: None,
+            pipeline: None,
+        };
+
+        let message = format_buildkite_message(&event);
+        assert!(message.is_empty()); // Should be filtered out now
+    }
+
+    #[test]
+    fn test_job_events_filtering() {
+        // Test that non-failure job events are filtered out
+        let scheduled_event = BuildkiteWebhookEvent {
+            event: "job.scheduled".to_string(),
+            build: None,
+            job: Some(BuildkiteJob {
+                id: Some("job123".to_string()),
+                name: Some("Test Job".to_string()),
+                command: Some("npm test".to_string()),
+                state: Some("scheduled".to_string()),
+                exit_status: None,
+                web_url: Some("https://buildkite.com/org/pipeline/builds/42#job123".to_string()),
+            }),
+            agent: None,
+            annotation: None,
+            pipeline: None,
+        };
+
+        let message = format_buildkite_message(&scheduled_event);
+        assert!(message.is_empty()); // Should be filtered out
+
+        let started_event = BuildkiteWebhookEvent {
+            event: "job.started".to_string(),
+            build: None,
+            job: Some(BuildkiteJob {
+                id: Some("job123".to_string()),
+                name: Some("Test Job".to_string()),
+                command: Some("npm test".to_string()),
+                state: Some("running".to_string()),
+                exit_status: None,
+                web_url: Some("https://buildkite.com/org/pipeline/builds/42#job123".to_string()),
+            }),
+            agent: None,
+            annotation: None,
+            pipeline: None,
+        };
+
+        let started_message = format_buildkite_message(&started_event);
+        assert!(started_message.is_empty()); // Should be filtered out
+    }
+
+    #[test]
+    fn test_format_build_scheduled_message() {
+        let event = BuildkiteWebhookEvent {
+            event: "build.scheduled".to_string(),
+            build: Some(BuildkiteBuild {
+                id: Some("abc123".to_string()),
+                number: Some(42),
+                state: Some("scheduled".to_string()),
+                message: Some("Add new feature for user authentication".to_string()),
+                commit: Some("abcdef1234567890".to_string()),
+                branch: Some("feature/auth-improvements".to_string()),
+                url: Some("https://api.buildkite.com/v2/builds/123".to_string()),
+                web_url: Some("https://buildkite.com/org/pipeline/builds/42".to_string()),
+                author: Some(BuildkiteAuthor {
+                    name: Some("Alice Developer".to_string()),
+                    email: Some("alice@example.com".to_string()),
+                }),
+            }),
+            agent: None,
+            annotation: None,
+            job: None,
+            pipeline: Some(BuildkitePipeline {
+                id: Some("pipeline123".to_string()),
+                name: Some("My Pipeline".to_string()),
+                slug: Some("my-pipeline".to_string()),
+                url: Some("https://api.buildkite.com/v2/pipelines/123".to_string()),
+                web_url: Some("https://buildkite.com/org/my-pipeline".to_string()),
+                repository: None,
+                provider: Some(BuildkiteProvider {
+                    id: Some("github".to_string()),
+                    settings: Some(BuildkiteProviderSettings {
+                        repository: Some("my-org/my-repo".to_string()),
+                    }),
+                    repository_url: Some("https://github.com/my-org/my-repo".to_string()),
+                }),
+            }),
+        };
+
+        let message = format_buildkite_message(&event);
+        assert!(
+            message
+                .contains("📅 Build [#42](https://buildkite.com/org/pipeline/builds/42) scheduled")
+        );
+        assert!(message.contains("> Add new feature for user authentication"));
+        assert!(
+            message
+                .contains("([abcdef1](https://github.com/my-org/my-repo/commit/abcdef1234567890))")
+        ); // GitHub commit link
     }
 }

@@ -4,12 +4,16 @@ A Rust-based webhook server that forwards Buildkite pipeline events to Zulip cha
 
 ## Features
 
-- Receives Buildkite webhook events (build started, finished, job completed)
-- Formats events into readable Zulip messages with emojis and links
+- **Comprehensive Event Support**: Handles **all 23+ Buildkite webhook event types** including builds, jobs, agents, annotations, and pipelines
+- **Smart Job Filtering**: Only forwards failed jobs to reduce noise (successful jobs are filtered out)
+- **GitHub Integration**: Automatic commit links with short SHA for build events when repository info is available  
 - **Smart Channel Routing**: Automatically routes messages to appropriate channels
   - `lang-*` pipelines → extract language code (e.g., `lang-sami-x-private` → `sami` channel)
   - `keyboard-*` pipelines → extract keyboard type (e.g., `keyboard-finnish-public` → `finnish` channel)
   - All other pipelines → default configured channel
+- **Rich Formatting**: Events formatted with emojis, links, and appropriate status indicators
+- **Ultra-compact Messages**: Single-line format for minimal visual noise
+- **Unique Topics**: Each build gets its own conversation thread for easy tracking
 - Configurable via command line arguments or environment variables
 - Built with Rust for performance and reliability
 
@@ -51,13 +55,51 @@ cargo run -- server \
 
 1. Go to your Buildkite pipeline settings
 2. Add a webhook with URL: `https://your-server.com/webhook`
-3. Select the events you want to forward (build.started, build.finished, job.finished)
+3. Select the events you want to forward (the bot supports **all Buildkite events** - see supported events section below)
 
 ## Supported Events
 
-- **build.started**: Notifies when a build starts
-- **build.finished**: Notifies when a build completes (with pass/fail status)
-- **job.finished**: Notifies when individual jobs complete
+The bot supports **all Buildkite webhook events** with appropriate formatting and emojis:
+
+### Build Events
+- **build.scheduled** 📅 - Build has been scheduled (includes commit message in quote block + GitHub commit link)
+- **build.started** 🔄 - Build starts (includes commit message in quote block + GitHub commit link)
+- **build.running** 🏃 - Build is currently running
+- **build.blocked** 🚫 - Build is blocked and waiting
+- **build.unblocked** 🟢 - Build has been unblocked
+- **build.created** 🆕 - New build created (includes commit message in quote block + GitHub commit link)
+- **build.rebuilt** 🔁 - Build has been rebuilt
+- **build.finished** ✅❌⏹️ - Build completed (with pass/fail/canceled status)
+- **build.passed** ✅ - Build passed successfully
+- **build.failed** ❌ - Build failed
+- **build.canceled** ⏹️ - Build was canceled
+
+### Job Events
+- **job.finished** ❌ - **Only failed jobs** are forwarded (successful jobs are filtered out for reduced noise)
+- ~~job.scheduled~~ - Filtered out
+- ~~job.started~~ - Filtered out  
+- ~~job.assigned~~ - Filtered out
+- ~~job.canceled~~ - Filtered out
+- ~~job.retried~~ - Filtered out
+- ~~job.timed_out~~ - Filtered out
+
+### Agent Events
+- **agent.connected** 🟢 - Build agent connected
+- **agent.disconnected** 🔴 - Build agent disconnected
+
+### Annotation Events
+- **annotation.created** 📝✅⚠️❌ℹ️ - Annotation added (emoji varies by style)
+- **annotation.updated** 📝✅⚠️❌ℹ️ - Annotation modified (emoji varies by style)
+- **annotation.deleted** 🗑️ - Annotation removed
+
+### Pipeline Events
+- **pipeline.created** 🆕 - New pipeline created
+- **pipeline.updated** 📝 - Pipeline configuration updated
+- **pipeline.deleted** 🗑️ - Pipeline removed
+
+### GitHub Integration
+- Build started and created events automatically include **GitHub commit links** with short SHA when repository information is available
+- Links format: `([abc1234](https://github.com/org/repo/commit/fullsha))`
 
 ## Message Format
 
