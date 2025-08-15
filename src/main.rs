@@ -414,12 +414,12 @@ fn format_buildkite_message(event: &BuildkiteWebhookEvent) -> String {
         "build.running" => {
             if let Some(ref build) = event.build {
                 format!(
-                    "🏃 Build [#{}]({}) running",
+                    "🚋 Build [#{}]({}) running",
                     build.number.unwrap_or(0),
                     build.web_url.as_deref().unwrap_or("#")
                 )
             } else {
-                "🏃 Build running".to_string()
+                "🚋 Build running".to_string()
             }
         }
         "build.blocked" => {
